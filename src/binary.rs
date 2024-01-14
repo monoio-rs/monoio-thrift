@@ -9,7 +9,7 @@ use monoio::{
 use smallvec::SmallVec;
 
 use crate::{
-    protocol::TInputProtocol,
+    protocol::{TInputProtocol, TAsyncSkipProtocol},
     thrift::{
         CowBytes, TFieldIdentifier, TListIdentifier, TMapIdentifier, TMessageIdentifier,
         TMessageType, TSetIdentifier, TStructIdentifier, TType,
@@ -32,6 +32,12 @@ fn field_type_from_u8(ttype: u8) -> Result<TType, CodecError> {
     })?;
 
     Ok(ttype)
+}
+
+#[inline(always)]
+fn advance(cursor: &mut Cursor<BytesMut>, cnt: usize) {
+    let pos = cursor.position() + cnt as u64;
+    cursor.set_position(pos);
 }
 
 // Read more data(at least to_read).
@@ -475,3 +481,213 @@ enum SkipData {
     Other(TType),
 }
 type SkipDataStack = SmallVec<[SkipData; MOST_COMMON_DEPTH]>;
+pub type TBinarySkipper<IO> = TBinaryProtocol<IO, Cursor<BytesMut>>;
+
+macro_rules! impl_async_fn {
+    (async fn $fname:ident(&mut $self:ident $(,$arg:ident: $arg_type:ty)*) -> Result<$futname:ident($out: ty)> { instant($imp:expr) }) => {
+        #[inline] async fn $fname(&mut $self $(,$arg : $arg_type)*) -> Result<$out, CodecError> { $imp }
+    };
+    (async fn $fname:ident(&mut $self:ident $(,$arg:ident: $arg_type:ty)*) -> Result<$futname:ident($out: ty)> { $($imp:tt)* }) => {
+        #[inline] async fn $fname(&mut $self $(,$arg : $arg_type)*) -> Result<$out, CodecError> { $($imp)*  }
+    };
+    ($(async fn $fname:ident(&mut $self:ident $(,$arg:ident: $arg_type:ty)*) -> Result<$futname:ident($out: ty)> { $($imp:tt)* })*) => {
+        $(impl_async_fn!(async fn $fname(&mut $self $(,$arg : $arg_type)*) -> Result<$futname($out)> { $($imp)* });)*
+    }
+}
+
+macro_rules! require_data {
+    ($self: expr, $n: expr) => {
+        if $self.attachment.remaining() < $n {
+            $self.fill_at_least($n).await?;
+        }
+    };
+}
+
+impl<T: AsyncReadRent> TAsyncSkipProtocol for TBinaryProtocol<T, Cursor<BytesMut>> {
+    impl_async_fn! {
+        async fn skip_message(&mut self) -> Result<SkipMessage(())> {
+            require_data!(self, 4);
+            let size = self.attachment.get_i32();
+
+            if size > 0 {
+                return Err(CodecError::new(
+                    CodecErrorKind::BadVersion,
+                    "Missing version in ReadMessageBegin".to_string(),
+                ));
+            }
+
+            let version = size & (VERSION_MASK as i32);
+            if version != (VERSION_1 as i32) {
+                return Err(CodecError::new(
+                    CodecErrorKind::BadVersion,
+                    "Bad version in ReadMessageBegin",
+                ));
+            }
+            // skip name and sequence number
+            require_data!(self, 4);
+            let len = self.attachment.get_i32() as usize;
+            require_data!(self, len + 4);
+            advance(&mut self.attachment, len + 4);
+            // skip struct
+            self.skip_field(TType::Struct).await?;
+            Ok(())
+        }
+        async fn skip_field(&mut self, ttype: TType) -> Result<SkipField(())> {
+            const BINARY_BASIC_TYPE_FIXED_SIZE: [usize; 17] = [
+                0,  // TType::Stop
+                0,  // TType::Void
+                1,  // TType::Bool
+                1,  // TType::I8
+                8,  // TType::Double
+                0,  // NAN
+                2,  // TType::I16
+                0,  // NAN
+                4,  // TType::I32
+                0,  // NAN
+                8,  // TType::I64
+                0,  // TType::Binary
+                0,  // TType::Struct
+                0,  // TType::Map
+                0,  // TType::List
+                0,  // TType::Set
+                16, // TType::Uuid
+            ];
+
+            macro_rules! pop {
+                ($stack:expr) => {
+                    match $stack.pop() {
+                        Some(last) => last,
+                        None => break,
+                    }
+                };
+            }
+            macro_rules! read_ttype {
+                ($attachment: expr) => {
+                    {
+                        let field_type_byte = $attachment.get_u8();
+                        let field_type: TType = field_type_byte.try_into().map_err(|_| {
+                        CodecError::new(
+                            CodecErrorKind::InvalidData,
+                            format!("invalid ttype {field_type_byte}"),
+                        )
+                        })?;
+                        field_type
+                    }
+                };
+            }
+
+            let mut stack = SkipDataStack::new();
+            let mut current = SkipData::Other(ttype);
+
+            loop {
+                match current {
+                    SkipData::Other(TType::Struct) => {
+                        require_data!(self, 1);
+                        let field_type = read_ttype!(self.attachment);
+
+                        // fast skip(only for better performance)
+                        let size = unsafe{*BINARY_BASIC_TYPE_FIXED_SIZE.get_unchecked(field_type as usize)};
+                        if size != 0 {
+                            require_data!(self, 2 + size);
+                            advance(&mut self.attachment, 2 + size);
+                            continue;
+                        }
+
+                        match field_type {
+                            TType::Stop => {
+                                current = pop!(stack);
+                            }
+                            _ => {
+                                require_data!(self, 2);
+                                advance(&mut self.attachment, 2); // field id
+                                stack.push(current);
+                                current = SkipData::Other(field_type);
+                            }
+                        }
+                    }
+                    SkipData::Other(ttype) => {
+                        match ttype {
+                            TType::Bool | TType::I8 => {
+                                require_data!(self, 1);
+                                advance(&mut self.attachment, 1);
+                                current = pop!(stack);
+                            },
+                            TType::Double | TType::I64 => {
+                                require_data!(self, 8);
+                                advance(&mut self.attachment, 8);
+                                current = pop!(stack);
+                            },
+                            TType::I16 => {
+                                require_data!(self, 2);
+                                advance(&mut self.attachment, 2);
+                                current = pop!(stack);
+                            },
+                            TType::I32 => {
+                                require_data!(self, 4);
+                                advance(&mut self.attachment, 4);
+                                current = pop!(stack);
+                            },
+                            TType::Binary => {
+                                require_data!(self, 4);
+                                let len = self.attachment.get_i32() as usize;
+                                require_data!(self, len);
+                                advance(&mut self.attachment, len);
+                                current = pop!(stack);
+                            },
+                            TType::Uuid => {
+                                require_data!(self, 16);
+                                advance(&mut self.attachment, 16);
+                                current = pop!(stack);
+                            },
+                            TType::List | TType::Set => {
+                                require_data!(self, 5);
+                                let element_type = read_ttype!(self.attachment);
+                                let element_len = self.attachment.get_i32() as u32;
+                                let size = unsafe{ *BINARY_BASIC_TYPE_FIXED_SIZE.get_unchecked(element_type as usize) };
+                                if size != 0 {
+                                    let skip = element_len as usize * size;
+                                    require_data!(self, skip);
+                                    advance(&mut self.attachment, skip);
+                                    current = pop!(stack);
+                                } else {
+                                    current = SkipData::Collection(element_len, [element_type, element_type]);
+                                }
+                            },
+                            TType::Map => {
+                                require_data!(self, 6);
+                                let element_type = read_ttype!(self.attachment);
+                                let element_type2 = read_ttype!(self.attachment);
+                                let element_len = self.attachment.get_i32() as u32;
+                                let size = unsafe{ *BINARY_BASIC_TYPE_FIXED_SIZE.get_unchecked(element_type as usize) };
+                                let size2 = unsafe{ *BINARY_BASIC_TYPE_FIXED_SIZE.get_unchecked(element_type2 as usize) };
+                                if size != 0 && size2 != 0 {
+                                    let skip = element_len as usize * (size + size2);
+                                    require_data!(self, skip);
+                                    advance(&mut self.attachment, skip);
+                                    current = pop!(stack);
+                                } else {
+                                    current = SkipData::Collection(element_len * 2, [element_type, element_type2]);
+                                }
+                            }
+                            _ => {
+                                return Err(CodecError::new(
+                                    CodecErrorKind::InvalidData,
+                                    format!("invalid ttype {}, normal type is expected", ttype as u8),
+                                ));
+                            }
+                        }
+                    }
+                    SkipData::Collection(len, ttypes) => {
+                        if len == 0 {
+                            current = pop!(stack);
+                            continue;
+                        }
+                        current = SkipData::Other(ttypes[(len & 1) as usize]);
+                        stack.push(SkipData::Collection(len - 1, ttypes));
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+}
