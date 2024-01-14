@@ -1,7 +1,10 @@
-use std::{io::{self, Cursor, Read}, ptr::copy_nonoverlapping};
+use std::{
+    io::{self, Cursor, Read},
+    ptr::copy_nonoverlapping,
+};
 
 use byteorder::{BigEndian, ReadBytesExt};
-use bytes::{Buf, BytesMut, Bytes};
+use bytes::{Buf, Bytes, BytesMut, BufMut};
 use monoio::{
     buf::{IoBufMut, SliceMut},
     io::AsyncReadRent,
@@ -9,7 +12,7 @@ use monoio::{
 use smallvec::SmallVec;
 
 use crate::{
-    protocol::{TInputProtocol, TAsyncSkipProtocol, TAsyncInputProtocol},
+    protocol::{TAsyncInputProtocol, TAsyncSkipProtocol, TInputProtocol, TOutputProtocol},
     thrift::{
         CowBytes, TFieldIdentifier, TListIdentifier, TMapIdentifier, TMessageIdentifier,
         TMessageType, TSetIdentifier, TStructIdentifier, TType,
@@ -68,10 +71,56 @@ pub async fn read_more_at_least<T: AsyncReadRent>(
     Ok(())
 }
 
+#[derive(Debug)]
+enum SkipData {
+    Collection(u32, [TType; 2]),
+    Other(TType),
+}
+type SkipDataStack = SmallVec<[SkipData; MOST_COMMON_DEPTH]>;
+pub type TBinarySkipper<IO> = TBinaryProtocol<IO, Cursor<BytesMut>>;
+type PositionStack = SmallVec<[usize; MOST_COMMON_DEPTH]>;
+pub type TBinaryReader<'a> = TBinaryProtocol<Cursor<&'a [u8]>, PositionStack>;
+pub type TBinaryWriter<'a> = TBinaryProtocol<&'a mut BytesMut, PositionStack>;
+
 pub struct TBinaryProtocol<T, A> {
     pub(crate) trans: T,
     // this buffer is only used for async decoder impl.
     pub(crate) attachment: A,
+}
+
+impl<T> TBinaryProtocol<T, Cursor<BytesMut>> {
+    pub fn new(io: T) -> Self {
+        Self {
+            trans: io,
+            attachment: Cursor::new(BytesMut::new()),
+        }
+    }
+}
+
+impl<'a> TBinaryProtocol<Cursor<&'a [u8]>, PositionStack> {
+    pub fn new(trans: Cursor<&'a [u8]>) -> Self {
+        Self {
+            trans,
+            attachment: SmallVec::new(),
+        }
+    }
+}
+
+impl<'a> TBinaryProtocol<&'a mut BytesMut, PositionStack> {
+    pub fn new(trans: &'a mut BytesMut) -> Self {
+        Self {
+            trans,
+            attachment: SmallVec::new(),
+        }
+    }
+
+    #[inline]
+    fn write_length(&mut self, len: usize) {
+        let pos = self.attachment.pop().expect("illegal thrift pair");
+        let len = len as i32;
+        // Note: use big endian for length as thrift encoding
+        self.trans[pos..pos + 4].copy_from_slice(&len.to_be_bytes());
+    }
 }
 
 impl<T, A> TBinaryProtocol<T, A> {
@@ -82,15 +131,6 @@ impl<T, A> TBinaryProtocol<T, A> {
     #[inline]
     pub fn from_parts(trans: T, attachment: A) -> Self {
         Self { trans, attachment }
-    }
-}
-
-impl<T> TBinaryProtocol<T, Cursor<BytesMut>> {
-    pub fn new(io: T) -> Self {
-        Self {
-            trans: io,
-            attachment: Cursor::new(BytesMut::new()),
-        }
     }
 }
 
@@ -486,14 +526,6 @@ impl<'x, A: 'static> TInputProtocol<'x> for TBinaryProtocol<Cursor<&'x [u8]>, A>
     }
 }
 
-#[derive(Debug)]
-enum SkipData {
-    Collection(u32, [TType; 2]),
-    Other(TType),
-}
-type SkipDataStack = SmallVec<[SkipData; MOST_COMMON_DEPTH]>;
-pub type TBinarySkipper<IO> = TBinaryProtocol<IO, Cursor<BytesMut>>;
-
 macro_rules! impl_async_fn {
     (async fn $fname:ident(&mut $self:ident $(,$arg:ident: $arg_type:ty)*) -> Result<$futname:ident($out: ty)> { instant($imp:expr) }) => {
         #[inline] async fn $fname(&mut $self $(,$arg : $arg_type)*) -> Result<$out, CodecError> { $imp }
@@ -843,5 +875,143 @@ impl<T: AsyncReadRent> TAsyncInputProtocol for TBinaryProtocol<T, BytesMut> {
                 "not a valid utf8 string",
             ))
         }
+    }
+}
+
+impl TOutputProtocol for TBinaryProtocol<&mut BytesMut, PositionStack> {
+    type Buf = BytesMut;
+
+    #[inline]
+    fn write_message_begin(&mut self, identifier: &TMessageIdentifier) {
+        let msg_type_u8: u8 = identifier.message_type.into();
+        let version = (VERSION_1 | msg_type_u8 as u32) as i32;
+        self.write_i32(version);
+        self.write_bytes(identifier.name.as_bytes());
+        self.write_i32(identifier.sequence_number);
+    }
+
+    #[inline(always)]
+    fn write_message_end(&mut self) {}
+
+    #[inline]
+    fn write_struct_begin(&mut self, _identifier: &TStructIdentifier) {}
+
+    #[inline(always)]
+    fn write_struct_end(&mut self) {}
+
+    #[inline]
+    fn write_field_begin(&mut self, field_type: TType, id: i16) {
+        let mut data: [u8; 3] = [0; 3];
+        data[0] = field_type as u8;
+        let id = id.to_be_bytes();
+        data[1] = id[0];
+        data[2] = id[1];
+        self.trans.put_slice(&data);
+    }
+
+    #[inline(always)]
+    fn write_field_end(&mut self) {}
+
+    #[inline]
+    fn write_field_stop(&mut self) {
+        self.write_byte(TType::Stop as u8);
+    }
+
+    #[inline]
+    fn write_list_begin(&mut self, identifier: &TListIdentifier) {
+        self.write_byte(identifier.element_type.into());
+        self.attachment.push(self.trans.len());
+        self.write_i32(identifier.size as i32);
+    }
+
+    #[inline]
+    fn write_list_end(&mut self, len: usize) {
+        self.write_length(len);
+    }
+
+    #[inline]
+    fn write_set_begin(&mut self, identifier: &TSetIdentifier) {
+        self.write_byte(identifier.element_type.into());
+        self.attachment.push(self.trans.len());
+        self.write_i32(identifier.size as i32);
+    }
+
+    #[inline]
+    fn write_set_end(&mut self, len: usize) {
+        self.write_length(len);
+    }
+
+    #[inline]
+    fn write_map_begin(&mut self, identifier: &TMapIdentifier) {
+        let key_type = identifier.key_type;
+        self.write_byte(key_type.into());
+        let val_type = identifier.value_type;
+        self.write_byte(val_type.into());
+        self.attachment.push(self.trans.len());
+        self.write_i32(identifier.size as i32);
+    }
+
+    #[inline]
+    fn write_map_end(&mut self, len: usize) {
+        self.write_length(len)
+    }
+
+    #[inline]
+    fn write_byte(&mut self, b: u8) {
+        self.trans.put_u8(b);
+    }
+
+    #[inline]
+    fn write_bool(&mut self, b: bool) {
+        self.trans.put_i8(if b { 1 } else { 0 });
+    }
+
+    #[inline]
+    fn write_i8(&mut self, i: i8) {
+        self.trans.put_i8(i);
+    }
+
+    #[inline]
+    fn write_i16(&mut self, i: i16) {
+        self.trans.put_i16(i);
+    }
+
+    #[inline]
+    fn write_i32(&mut self, i: i32) {
+        self.trans.put_i32(i);
+    }
+
+    #[inline]
+    fn write_i64(&mut self, i: i64) {
+        self.trans.put_i64(i);
+    }
+
+    #[inline]
+    fn write_double(&mut self, d: f64) {
+        self.trans.put_f64(d);
+    }
+
+    #[inline]
+    fn write_uuid(&mut self, u: [u8; 16]) {
+        self.trans.put_slice(&u);
+    }
+
+    #[inline]
+    fn write_bytes(&mut self, b: &[u8]) {
+        self.write_i32(b.len() as i32);
+        self.trans.put_slice(b);
+    }
+
+    #[inline]
+    fn write_string(&mut self, s: &str) {
+        self.write_bytes(s.as_bytes());
+    }
+
+    #[inline(always)]
+    fn flush(&mut self) {}
+
+    #[inline]
+    fn buf(&mut self) -> &mut Self::Buf {
+        self.trans
     }
 }
