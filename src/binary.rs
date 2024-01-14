@@ -1,7 +1,7 @@
-use std::io::{self, Cursor, Read};
+use std::{io::{self, Cursor, Read}, ptr::copy_nonoverlapping};
 
 use byteorder::{BigEndian, ReadBytesExt};
-use bytes::{Buf, BytesMut};
+use bytes::{Buf, BytesMut, Bytes};
 use monoio::{
     buf::{IoBufMut, SliceMut},
     io::AsyncReadRent,
@@ -9,7 +9,7 @@ use monoio::{
 use smallvec::SmallVec;
 
 use crate::{
-    protocol::{TInputProtocol, TAsyncSkipProtocol},
+    protocol::{TInputProtocol, TAsyncSkipProtocol, TAsyncInputProtocol},
     thrift::{
         CowBytes, TFieldIdentifier, TListIdentifier, TMapIdentifier, TMessageIdentifier,
         TMessageType, TSetIdentifier, TStructIdentifier, TType,
@@ -91,6 +91,17 @@ impl<T> TBinaryProtocol<T, Cursor<BytesMut>> {
             trans: io,
             attachment: Cursor::new(BytesMut::new()),
         }
+    }
+}
+
+impl<T: AsyncReadRent> TBinaryProtocol<T, BytesMut> {
+    async fn fill_at_least(&mut self, n: usize) -> std::io::Result<()> {
+        let rem = self.attachment.remaining();
+        if rem >= n {
+            return Ok(());
+        }
+        let to_read = n - rem;
+        read_more_at_least(&mut self.trans, &mut self.attachment, to_read).await
     }
 }
 
@@ -688,6 +699,149 @@ impl<T: AsyncReadRent> TAsyncSkipProtocol for TBinaryProtocol<T, Cursor<BytesMut
                 }
             }
             Ok(())
+        }
+    }
+}
+
+impl<T: AsyncReadRent> TAsyncInputProtocol for TBinaryProtocol<T, BytesMut> {
+    impl_async_fn! {
+        async fn read_message_begin(&mut self) -> Result<ReadMessageBegin(TMessageIdentifier<'static>)> {
+            let size = self.read_i32().await?;
+
+            if size > 0 {
+                return Err(CodecError::new(
+                    CodecErrorKind::BadVersion,
+                    "Missing version in ReadMessageBegin".to_string(),
+                ));
+            }
+            let type_u8 = (size & 0xf) as u8;
+
+            let message_type = TMessageType::try_from(type_u8).map_err(|_| {
+                CodecError::new(
+                    CodecErrorKind::InvalidData,
+                    format!("invalid message type {}", type_u8),
+                )
+            })?;
+
+            let version = size & (VERSION_MASK as i32);
+            if version != (VERSION_1 as i32) {
+                return Err(CodecError::new(
+                    CodecErrorKind::BadVersion,
+                    "Bad version in ReadMessageBegin",
+                ));
+            }
+
+            let name = CowBytes::Owned(self.read_string().await?);
+
+            let sequence_number = self.read_i32().await?;
+            Ok(TMessageIdentifier::new(name, message_type, sequence_number))
+        }
+        async fn read_message_end(&mut self) -> Result<ReadMessageEnd(())> {
+            instant(Ok(()))
+        }
+        async fn read_struct_begin(&mut self) -> Result<ReadStructBegin(TStructIdentifier)> {
+            instant(Ok(TStructIdentifier::new(None)))
+        }
+        async fn read_struct_end(&mut self) -> Result<ReadStructEnd(())> {
+            instant(Ok(()))
+        }
+        async fn read_field_begin(&mut self) -> Result<ReadFieldBegin(TFieldIdentifier)> {
+            let field_type_byte = self.read_byte().await?;
+            let field_type = field_type_byte.try_into().map_err(|_| {
+                CodecError::new(
+                    CodecErrorKind::InvalidData,
+                    format!("invalid ttype {}", field_type_byte),
+                )
+            })?;
+            let id = match field_type {
+                TType::Stop => Ok(0),
+                _ => self.read_i16().await,
+            }?;
+            Ok(TFieldIdentifier::new(None, field_type, Some(id)))
+        }
+        async fn read_field_end(&mut self) -> Result<ReadFieldEnd(())> {
+            instant(Ok(()))
+        }
+        async fn read_list_begin(&mut self) -> Result<ReadListBegin(TListIdentifier)> {
+            let element_type = self.read_byte().await.and_then(field_type_from_u8)?;
+            let size = self.read_i32().await?;
+            Ok(TListIdentifier::new(element_type, size as usize))
+        }
+        async fn read_list_end(&mut self) -> Result<ReadListEnd(())> {
+            instant(Ok(()))
+        }
+        async fn read_set_begin(&mut self) -> Result<ReadSetBegin(TSetIdentifier)> {
+            let element_type = self.read_byte().await.and_then(field_type_from_u8)?;
+            let size = self.read_i32().await?;
+            Ok(TSetIdentifier::new(element_type, size as usize))
+        }
+        async fn read_set_end(&mut self) -> Result<ReadSetEnd(())> {
+            instant(Ok(()))
+        }
+        async fn read_map_begin(&mut self) -> Result<ReadMapBegin(TMapIdentifier)> {
+            let key_type = self.read_byte().await.and_then(field_type_from_u8)?;
+            let value_type = self.read_byte().await.and_then(field_type_from_u8)?;
+            let size = self.read_i32().await?;
+            Ok(TMapIdentifier::new(key_type, value_type, size as usize))
+        }
+        async fn read_map_end(&mut self) -> Result<ReadMapEnd(())> {
+            instant(Ok(()))
+        }
+        async fn read_byte(&mut self) -> Result<ReadByte(u8)> {
+            require_data!(self, 1);
+            Ok(self.attachment.get_u8())
+        }
+        async fn read_bool(&mut self) -> Result<ReadBool(bool)> {
+            Ok(self.read_i8().await? != 0)
+        }
+        async fn read_i8(&mut self) -> Result<ReadI8(i8)> {
+            require_data!(self, 1);
+            Ok(self.attachment.get_i8())
+        }
+        async fn read_i16(&mut self) -> Result<ReadI16(i16)> {
+            require_data!(self, 2);
+            Ok(self.attachment.get_i16())
+        }
+        async fn read_i32(&mut self) -> Result<ReadI32(i32)> {
+            require_data!(self, 4);
+            Ok(self.attachment.get_i32())
+        }
+        async fn read_i64(&mut self) -> Result<ReadI64(i64)> {
+            require_data!(self, 8);
+            Ok(self.attachment.get_i64())
+        }
+        async fn read_double(&mut self) -> Result<ReadDouble(f64)> {
+            require_data!(self, 8);
+            Ok(self.attachment.get_f64())
+        }
+        async fn read_uuid(&mut self) -> Result<ReadUuid([u8; 16])> {
+            require_data!(self, 16);
+            let mut out = [0; 16];
+            unsafe { copy_nonoverlapping(self.attachment.as_ptr(), out.as_mut_ptr(), 16) };
+            self.attachment.advance(16);
+            Ok(out)
+        }
+        async fn read_bytes(&mut self) -> Result<ReadBytes(Bytes)> {
+            let length = self.read_i32().await? as usize;
+            require_data!(self, length);
+            let out = self.attachment.split_to(length).freeze();
+            Ok(out)
+        }
+        async fn read_string(&mut self) -> Result<ReadString(Bytes)> {
+            let data = self.read_bytes().await?;
+            if data.is_empty() {
+                return Ok(data);
+            }
+            if let Some(chunk) = std::str::Utf8Chunks::new(&data).next() {
+                let s = chunk.valid();
+                if s.len() == data.len() {
+                    return Ok(data);
+                }
+            }
+            Err(CodecError::new(
+                CodecErrorKind::InvalidData,
+                "not a valid utf8 string",
+            ))
         }
     }
 }
