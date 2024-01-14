@@ -1,7 +1,11 @@
-use std::io::{Cursor, Read};
+use std::io::{self, Cursor, Read};
 
 use byteorder::{BigEndian, ReadBytesExt};
-use bytes::Buf;
+use bytes::{Buf, BytesMut};
+use monoio::{
+    buf::{IoBufMut, SliceMut},
+    io::AsyncReadRent,
+};
 use smallvec::SmallVec;
 
 use crate::{
@@ -30,6 +34,34 @@ fn field_type_from_u8(ttype: u8) -> Result<TType, CodecError> {
     Ok(ttype)
 }
 
+// Read more data(at least to_read).
+pub async fn read_more_at_least<T: AsyncReadRent>(
+    mut io: T,
+    buffer: &mut BytesMut,
+    to_read: usize,
+) -> std::io::Result<()> {
+    // We will reserve at least that much buffer to save syscalls.
+    const MIN_CAPACITY: usize = 4096;
+    buffer.reserve(to_read.max(MIN_CAPACITY));
+
+    let mut read = buffer.len();
+    let end = buffer.capacity();
+    let at_least = read + to_read;
+    while read < at_least {
+        let buf = std::mem::take(buffer);
+        let slice = unsafe { SliceMut::new_unchecked(buf, read, end) };
+        let (r, b) = io.read(slice).await;
+        *buffer = b.into_inner();
+        let n = r?;
+        if n == 0 {
+            return Err(io::ErrorKind::UnexpectedEof.into());
+        }
+        read += n;
+        unsafe { buffer.set_init(read) };
+    }
+    Ok(())
+}
+
 pub struct TBinaryProtocol<T, A> {
     pub(crate) trans: T,
     // this buffer is only used for async decoder impl.
@@ -44,6 +76,26 @@ impl<T, A> TBinaryProtocol<T, A> {
     #[inline]
     pub fn from_parts(trans: T, attachment: A) -> Self {
         Self { trans, attachment }
+    }
+}
+
+impl<T> TBinaryProtocol<T, Cursor<BytesMut>> {
+    pub fn new(io: T) -> Self {
+        Self {
+            trans: io,
+            attachment: Cursor::new(BytesMut::new()),
+        }
+    }
+}
+
+impl<T: AsyncReadRent> TBinaryProtocol<T, Cursor<BytesMut>> {
+    async fn fill_at_least(&mut self, n: usize) -> std::io::Result<()> {
+        let rem = self.attachment.remaining();
+        if rem >= n {
+            return Ok(());
+        }
+        let to_read = n - rem;
+        read_more_at_least(&mut self.trans, self.attachment.get_mut(), to_read).await
     }
 }
 
