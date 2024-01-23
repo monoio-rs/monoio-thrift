@@ -232,21 +232,6 @@ dependencies = [
 
 [[package]]
 name = "monoio-codec"
-version = "0.0.0"
-dependencies = [
- "byteorder",
- "bytes",
- "monoio",
- "monoio-codec 0.3.1",
- "num_enum",
- "small-map",
- "smallvec",
- "smol_str",
- "tracing",
-]
-
-[[package]]
-name = "monoio-codec"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3764cbbc38b7634415ff013d8f7a6369f54cb86dbed4e43c8e7fed00e9383ecc"
@@ -265,6 +250,21 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "monoio-thrift"
+version = "0.0.1"
+dependencies = [
+ "byteorder",
+ "bytes",
+ "monoio",
+ "monoio-codec",
+ "num_enum",
+ "small-map",
+ "smallvec",
+ "smol_str",
+ "tracing",
 ]
 
 [[package]]

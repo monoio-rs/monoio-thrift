@@ -215,6 +215,15 @@ impl Decoder for TTHeaderDecoder {
         }
 
         if src[4..HEADER_DETECT_LENGTH] == [0x10, 0x00] {
+            let mut header_length = [0; 2];
+            unsafe { copy_nonoverlapping(src.as_ptr().add(12), header_length.as_mut_ptr(), 2) };
+            let header_length = u16::from_be_bytes(header_length) as usize * 4;
+            if src.len() < header_length + MIN_HEADER_LENGTH {
+                return Ok(Decoded::InsufficientAtLeast(
+                    header_length + MIN_HEADER_LENGTH,
+                ));
+            }
+
             let mut length = [0; 4];
             unsafe { copy_nonoverlapping(src.as_ptr(), length.as_mut_ptr(), 4) };
             let length = u32::from_be_bytes(length);
