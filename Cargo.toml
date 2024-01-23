@@ -5,10 +5,10 @@ description = "Thrift for Monoio."
 edition = "2021"
 keywords = ["async", "thrift", "monoio"]
 license = "MIT/Apache-2.0"
-name = "monoio-codec"
+name = "monoio-thrift"
 readme = "README.md"
 repository = "https://github.com/monoio-rs/monoio-thrift"
-version = "0.0.0"
+version = "0.0.1"
 
 [dependencies]
 monoio = "0.2.0"
