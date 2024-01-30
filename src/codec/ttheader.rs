@@ -2,7 +2,7 @@
 //!
 //! For more information, please visit https://www.cloudwego.io/docs/kitex/reference/transport_protocol_ttheader/
 
-use std::{io, marker::PhantomData, ptr::copy_nonoverlapping};
+use std::{io, ptr::copy_nonoverlapping};
 
 use small_map::SmallMap;
 use smallvec::SmallVec;
@@ -27,11 +27,6 @@ pub struct TTHeader {
     pub int_headers_ext: SmallVec<[(u16, SmolStr); 2]>,
     pub str_headers: HeaderMap,
     pub acl_token: Option<SmolStr>,
-}
-
-pub struct TTHeaderPayload<T> {
-    pub ttheader: TTHeader,
-    pub payload: Option<T>,
 }
 
 impl Default for TTHeader {
@@ -203,7 +198,14 @@ impl TTHeader {
     }
 }
 
+#[derive(Default)]
 pub struct TTHeaderDecoder;
+
+impl TTHeaderDecoder {
+    pub const fn new() -> Self {
+        Self
+    }
+}
 
 impl Decoder for TTHeaderDecoder {
     type Item = TTHeader;
@@ -240,7 +242,14 @@ impl Decoder for TTHeaderDecoder {
     }
 }
 
+#[derive(Default)]
 pub struct TTHeaderEncoder;
+
+impl TTHeaderEncoder {
+    pub const fn new() -> Self {
+        Self
+    }
+}
 
 impl Encoder<TTHeader> for TTHeaderEncoder {
     type Error = io::Error;
@@ -330,6 +339,20 @@ impl Encoder<TTHeader> for TTHeaderEncoder {
     }
 }
 
+pub struct TTHeaderPayload<T> {
+    pub ttheader: TTHeader,
+    pub payload: Option<T>,
+}
+
+impl<T> Default for TTHeaderPayload<T> {
+    fn default() -> Self {
+        Self {
+            ttheader: Default::default(),
+            payload: Default::default(),
+        }
+    }
+}
+
 impl<T> TTHeaderPayload<T> {
     fn new() -> Self {
         Self {
@@ -339,11 +362,11 @@ impl<T> TTHeaderPayload<T> {
     }
 }
 
-pub struct TTHeaderPayloadDecoder<T: Decoder> {
+pub struct TTHeaderPayloadDecoder<T> {
     payload_decoder: T,
 }
 
-impl<T: Decoder> TTHeaderPayloadDecoder<T> {
+impl<T> TTHeaderPayloadDecoder<T> {
     pub fn new(payload_decoder: T) -> Self {
         Self { payload_decoder }
     }
@@ -385,21 +408,17 @@ where
     }
 }
 
-pub struct TTHeaderPayloadEncoder<T, E: Encoder<T>> {
-    payload_encoder: E,
-    _priv: PhantomData<T>,
+pub struct TTHeaderPayloadEncoder<T> {
+    payload_encoder: T,
 }
 
-impl<E: Encoder<T>, T> TTHeaderPayloadEncoder<T, E> {
-    pub fn new(payload_encoder: E) -> Self {
-        Self {
-            payload_encoder,
-            _priv: PhantomData,
-        }
+impl<T> TTHeaderPayloadEncoder<T> {
+    pub fn new(payload_encoder: T) -> Self {
+        Self { payload_encoder }
     }
 }
 
-impl<T, E: Encoder<T>> Encoder<TTHeaderPayload<T>> for TTHeaderPayloadEncoder<T, E> {
+impl<T, E: Encoder<T>> Encoder<TTHeaderPayload<T>> for TTHeaderPayloadEncoder<E> {
     type Error = E::Error;
 
     fn encode(
@@ -417,6 +436,35 @@ impl<T, E: Encoder<T>> Encoder<TTHeaderPayload<T>> for TTHeaderPayloadEncoder<T,
         let mut buf = &mut dst[zero_index..zero_index + 4];
         buf.put_u32((size - 4) as u32);
         tracing::trace!("encode ttheader write length size: {}", size - 4);
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+pub struct RawPayloadCodec;
+
+impl RawPayloadCodec {
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+impl Decoder for RawPayloadCodec {
+    type Item = bytes::Bytes;
+
+    type Error = io::Error;
+
+    fn decode(&mut self, src: &mut bytes::BytesMut) -> Result<Decoded<Self::Item>, Self::Error> {
+        Ok(Decoded::Some(bytes::Bytes::from(src.split())))
+    }
+}
+
+impl Encoder<bytes::Bytes> for RawPayloadCodec {
+    type Error = io::Error;
+
+    fn encode(&mut self, item: bytes::Bytes, dst: &mut bytes::BytesMut) -> Result<(), Self::Error> {
+        dst.reserve(item.len());
+        dst.extend_from_slice(&item);
         Ok(())
     }
 }
