@@ -4,7 +4,7 @@ use std::{
 };
 
 use byteorder::{BigEndian, ReadBytesExt};
-use bytes::{Buf, Bytes, BytesMut, BufMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use monoio::{
     buf::{IoBufMut, SliceMut},
     io::AsyncReadRent,
