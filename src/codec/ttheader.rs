@@ -15,6 +15,7 @@ use num_enum::TryFromPrimitive;
 
 pub type HeaderMap = SmallMap<16, SmolStr, SmolStr>;
 
+#[derive(Clone)]
 pub struct TTHeader {
     pub header_length: u32,
     pub payload_length: u32,
@@ -342,6 +343,18 @@ impl Encoder<TTHeader> for TTHeaderEncoder {
 pub struct TTHeaderPayload<T> {
     pub ttheader: TTHeader,
     pub payload: Option<T>,
+}
+
+impl<T> Clone for TTHeaderPayload<T>
+where
+    T: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            ttheader: self.ttheader.clone(),
+            payload: self.payload.clone(),
+        }
+    }
 }
 
 impl<T> Default for TTHeaderPayload<T> {
