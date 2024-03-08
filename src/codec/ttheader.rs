@@ -3,8 +3,8 @@
 //! For more information, please visit https://www.cloudwego.io/docs/kitex/reference/transport_protocol_ttheader/
 
 use std::{io, ptr::copy_nonoverlapping};
+use std::collections::HashMap;
 
-use small_map::SmallMap;
 use smallvec::SmallVec;
 use smol_str::SmolStr;
 
@@ -13,7 +13,7 @@ use monoio_codec::{Decoded, Decoder, Encoder};
 use bytes::{Buf, BufMut};
 use num_enum::TryFromPrimitive;
 
-pub type HeaderMap = SmallMap<16, SmolStr, SmolStr>;
+pub type HeaderMap = HashMap<SmolStr, SmolStr>;
 
 #[derive(Clone)]
 pub struct TTHeader {
