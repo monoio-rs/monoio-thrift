@@ -2,8 +2,8 @@
 //!
 //! For more information, please visit https://www.cloudwego.io/docs/kitex/reference/transport_protocol_ttheader/
 
-use std::{io, ptr::copy_nonoverlapping};
 use std::collections::HashMap;
+use std::{io, ptr::copy_nonoverlapping};
 
 use smallvec::SmallVec;
 use smol_str::SmolStr;
@@ -375,17 +375,17 @@ impl<T> TTHeaderPayload<T> {
     }
 }
 
-pub struct TTHeaderPayloadDecoder<T> {
-    payload_decoder: T,
+pub struct TTHeaderPayloadCodec<T> {
+    inner: T,
 }
 
-impl<T> TTHeaderPayloadDecoder<T> {
-    pub fn new(payload_decoder: T) -> Self {
-        Self { payload_decoder }
+impl<T> TTHeaderPayloadCodec<T> {
+    pub fn new(inner: T) -> Self {
+        Self { inner }
     }
 }
 
-impl<T: Decoder> Decoder for TTHeaderPayloadDecoder<T>
+impl<T: Decoder> Decoder for TTHeaderPayloadCodec<T>
 where
     T::Error: From<io::Error>,
 {
@@ -408,7 +408,7 @@ where
 
             let mut item = Self::Item::new();
             item.ttheader.decode_header(length, src)?;
-            match self.payload_decoder.decode(src) {
+            match self.inner.decode(src) {
                 Ok(Decoded::Some(payload)) => item.payload = Some(payload),
                 Err(e) => return Err(e),
                 // we have already checked sufficient size, so it's err if Insufficient
@@ -421,17 +421,7 @@ where
     }
 }
 
-pub struct TTHeaderPayloadEncoder<T> {
-    payload_encoder: T,
-}
-
-impl<T> TTHeaderPayloadEncoder<T> {
-    pub fn new(payload_encoder: T) -> Self {
-        Self { payload_encoder }
-    }
-}
-
-impl<T, E: Encoder<T>> Encoder<TTHeaderPayload<T>> for TTHeaderPayloadEncoder<E> {
+impl<T, E: Encoder<T>> Encoder<TTHeaderPayload<T>> for TTHeaderPayloadCodec<E> {
     type Error = E::Error;
 
     fn encode(
@@ -442,7 +432,7 @@ impl<T, E: Encoder<T>> Encoder<TTHeaderPayload<T>> for TTHeaderPayloadEncoder<E>
         let zero_index = dst.len();
         let mut ttheader_encoder = TTHeaderEncoder {};
         ttheader_encoder.encode(item.ttheader, dst)?;
-        self.payload_encoder
+        self.inner
             .encode(item.payload.expect("payload must some"), dst)?;
         // fill length
         let size = dst.len() - zero_index;
