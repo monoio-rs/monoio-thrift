@@ -317,6 +317,13 @@ impl Encoder<TTHeader> for TTHeaderEncoder {
         let mut buf = &mut dst[int_kv_index..int_kv_index + 2];
         buf.put_u16(int_kv_len);
 
+        // fill acl_token
+        if let Some(ref acl_token) = item.acl_token {
+            dst.put_u8(info::ACL_TOKEN_KEY_VALUE);
+            dst.put_u16(acl_token.len() as u16);
+            dst.put_slice(acl_token.as_bytes());
+        }
+
         // write padding
         let overflow = (dst.len() - 14 - zero_index) % 4;
         let padding = (4 - overflow) % 4;
