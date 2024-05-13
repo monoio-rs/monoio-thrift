@@ -332,7 +332,7 @@ impl<'x, A: 'static> TInputProtocol<'x> for TBinaryProtocol<Cursor<&'x [u8]>, A>
         if data.is_empty() {
             return Ok("");
         }
-        if let Some(chunk) = std::str::Utf8Chunks::new(data).next() {
+        if let Some(chunk) = data.utf8_chunks().next() {
             let s = chunk.valid();
             if s.len() == data.len() {
                 return Ok(s);
@@ -864,7 +864,7 @@ impl<T: AsyncReadRent> TAsyncInputProtocol for TBinaryProtocol<T, BytesMut> {
             if data.is_empty() {
                 return Ok(data);
             }
-            if let Some(chunk) = std::str::Utf8Chunks::new(&data).next() {
+            if let Some(chunk) = data.utf8_chunks().next() {
                 let s = chunk.valid();
                 if s.len() == data.len() {
                     return Ok(data);

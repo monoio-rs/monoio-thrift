@@ -1,5 +1,3 @@
-#![feature(utf8_chunks)]
-
 pub mod codec;
 
 mod error;
