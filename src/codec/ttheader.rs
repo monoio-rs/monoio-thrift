@@ -111,9 +111,7 @@ impl TTHeader {
         macro_rules! read_str_checked {
             ($buf: ident, $index: ident, $len: expr) => {{
                 let val_len = read_u16_checked!($buf, $index, $len);
-                if $index + val_len as usize > $len as usize
-                    || val_len as usize > MAX_HEADER_STRING_LENGTH
-                {
+                if $index + val_len as usize > $len as usize {
                     return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid data"));
                 }
                 unsafe { read_raw_str_unchecked($buf, val_len as usize, &mut $index) }
@@ -154,12 +152,6 @@ impl TTHeader {
                 }
                 info::INFO_KEY_VALUE => {
                     let kv_size = read_u16_checked!(buf, index, self.header_length);
-                    if kv_size as usize > MAX_NUM_HEADERS {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("too many headers: {kv_size}, max: {MAX_NUM_HEADERS}"),
-                        ));
-                    }
                     // TODO: reserve
                     for _ in 0..kv_size {
                         let key = read_str_checked!(buf, index, self.header_length);
@@ -485,8 +477,6 @@ const HEADER_DETECT_LENGTH: usize = 6;
 const MIN_HEADER_LENGTH: usize = 14;
 
 pub const TT_HEADER_MAGIC: u16 = 0x1000;
-pub const MAX_HEADER_STRING_LENGTH: usize = 4 * 1024; // 4k
-pub const MAX_NUM_HEADERS: usize = 1024; // 1k
 
 mod info {
     pub const INFO_PADDING: u8 = 0x00;
