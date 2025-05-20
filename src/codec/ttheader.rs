@@ -301,7 +301,7 @@ impl Encoder<TTHeader> for TTHeaderEncoder {
 
         for (key, val) in item.int_headers_ext.iter() {
             dst.put_u16(*key);
-            dst.put_slice(val.as_bytes());
+            put_str(val, dst);
             int_kv_len += 1;
         }
 
